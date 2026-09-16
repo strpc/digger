@@ -43,6 +43,7 @@ Resolves one or more hostnames and returns their IPv4 addresses, one per line, s
 | `host` | yes | — | Hostname to resolve. Repeat for multiple hosts. |
 | `cache` | no | `true` | Set to `false` to bypass cache read (result is still written to cache). |
 | `ttl` | no | `300` | Per-request cache TTL in seconds. `0` always returns a fresh result. |
+| `subdomains` | no | `false` | Set to `true` to discover passive subdomains before resolving. Invalid boolean values return `400`. |
 
 **Response:** `200 OK`, `Content-Type: text/plain`
 
@@ -50,10 +51,20 @@ Resolves one or more hostnames and returns their IPv4 addresses, one per line, s
 
 - `X-Cache: HIT` — result served from cache
 - `X-Cache: MISS` — result freshly resolved
+- `X-Subdomains-Status: complete` — discovery completed, including when no names were found
+- `X-Subdomains-Status: limited` — the global discovered-name limit was reached
+- `X-Subdomains-Status: degraded` — discovery failed or timed out; only the original hosts were resolved
+- `X-Subdomains-Source: subfinder` — Subfinder was used (`complete` or `limited`)
+- `X-Subdomains-Source: none` — discovery was unavailable, or all inputs were IP literals
+
+The `X-Subdomains-*` headers are only present when `subdomains=true`. Successful
+`complete` and `limited` results are cached with their metadata; degraded results
+are never cached. Cache entries for requests with and without discovery are separate.
 
 **Errors:**
 
 - `400` — no `host` parameter
+- `400` — invalid `subdomains` boolean
 - `404` — unknown path
 
 **Examples:**
@@ -67,7 +78,21 @@ curl "http://localhost:8080/resolve?host=t.me&host=telegram.org&ttl=600"
 
 # Force fresh lookup, bypass cache
 curl "http://localhost:8080/resolve?host=t.me&cache=false"
+
+# Discover passive subdomains, then resolve all unique IPv4 addresses
+curl "http://localhost:8080/resolve?host=example.com&subdomains=true"
 ```
+
+Subdomain discovery uses Subfinder's passive sources that explicitly require no
+API key. Provider configuration and API keys are not supported. Each requested
+host is its own search boundary: no public-suffix expansion is performed. Only
+ASCII DNS names (including punycode) are accepted from discovery, and wildcard or
+out-of-bound names are discarded.
+
+Discovery is best-effort and may be incomplete: one operation runs at a time,
+waits at most 15 seconds overall, and keeps at most `SUBDOMAIN_LIMIT` new unique
+names across the request. DNS lookups are limited to 32 concurrent operations
+process-wide and 3 seconds each, including time waiting for a lookup slot.
 
 ---
 
@@ -99,6 +124,7 @@ cache cleared
 |----------------------|---------|-------------|
 | `PORT` | `8080` | Port to listen on |
 | `CACHE_TTL` | `300` | Default cache TTL in seconds |
+| `SUBDOMAIN_LIMIT` | `500` | Positive global limit for newly discovered unique names per request; invalid values prevent startup |
 
 ---
 
@@ -113,6 +139,7 @@ services:
       - "8080:8080"
     environment:
       CACHE_TTL: 300
+      SUBDOMAIN_LIMIT: 500
       PORT: 8080
 ```
 
@@ -128,6 +155,7 @@ services:
 ## Development 🛠️
 
 ```bash
+go version # Go 1.25 or newer
 go run ./cmd/digger
 
 # or build
@@ -135,7 +163,10 @@ go build -o digger ./cmd/digger
 ./digger
 ```
 
-No external dependencies — stdlib only.
+Subdomain discovery is provided by
+[`github.com/projectdiscovery/subfinder/v2`](https://github.com/projectdiscovery/subfinder)
+v2.16.0 through an internal adapter; its SDK types are not exposed to the HTTP or
+service layers.
 
 ---
 
@@ -147,4 +178,3 @@ Multi-platform image (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) published to
 docker pull ghcr.io/strpc/digger:latest
 docker pull ghcr.io/strpc/digger:v1.0.0
 ```
-

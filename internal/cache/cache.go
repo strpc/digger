@@ -9,7 +9,13 @@ import (
 
 type entry struct {
 	timestamp time.Time
-	ips       []string
+	result    Result
+}
+
+type Result struct {
+	IPs              []string
+	SubdomainsStatus string
+	SubdomainsSource string
 }
 
 type Cache struct {
@@ -35,19 +41,28 @@ func Key(hosts []string) string {
 
 // Get returns cached IPs if the entry exists and is fresher than ttl.
 func (c *Cache) Get(key string, ttl time.Duration) ([]string, bool) {
+	result, ok := c.GetResult(key, ttl)
+	return result.IPs, ok
+}
+
+func (c *Cache) GetResult(key string, ttl time.Duration) (Result, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	e, ok := c.entries[key]
 	if !ok || ttl <= 0 || time.Since(e.timestamp) >= ttl {
-		return nil, false
+		return Result{}, false
 	}
-	return e.ips, true
+	return e.result, true
 }
 
 func (c *Cache) Set(key string, ips []string) {
+	c.SetResult(key, Result{IPs: ips})
+}
+
+func (c *Cache) SetResult(key string, result Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = entry{timestamp: time.Now(), ips: ips}
+	c.entries[key] = entry{timestamp: time.Now(), result: result}
 }
 
 func (c *Cache) Clear() {
