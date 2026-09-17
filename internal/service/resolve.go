@@ -11,13 +11,12 @@ import (
 	"github.com/strpc/digger/internal/cache"
 )
 
-const discoveryTimeout = 15 * time.Second
-
 const (
 	SubdomainsComplete = "complete"
 	SubdomainsLimited  = "limited"
+	SubdomainsPartial  = "partial"
 	SubdomainsDegraded = "degraded"
-	SubdomainsSource   = "subfinder"
+	SubdomainsSource   = "direct"
 	NoSource           = "none"
 )
 
@@ -43,10 +42,11 @@ type Resolver struct {
 	dns        DNSResolver
 	discoverer Discoverer
 	limit      int
+	timeout    time.Duration
 }
 
-func NewResolver(c *cache.Cache, dns DNSResolver, discoverer Discoverer, limit int) *Resolver {
-	return &Resolver{cache: c, dns: dns, discoverer: discoverer, limit: limit}
+func NewResolver(c *cache.Cache, dns DNSResolver, discoverer Discoverer, limit int, timeout time.Duration) *Resolver {
+	return &Resolver{cache: c, dns: dns, discoverer: discoverer, limit: limit, timeout: timeout}
 }
 
 func (s *Resolver) Resolve(ctx context.Context, hosts []string, subdomains, useCache bool, ttl time.Duration) (Result, error) {
@@ -103,7 +103,7 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 		return hosts, SubdomainsComplete, NoSource, true, nil
 	}
 
-	discoveryCtx, cancelDiscovery := context.WithTimeout(parent, discoveryTimeout)
+	discoveryCtx, cancelDiscovery := context.WithTimeout(parent, s.timeout)
 	defer cancelDiscovery()
 
 	originals := make(map[string]struct{}, len(hosts))
@@ -115,7 +115,7 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 
 	discovered := make(map[string]struct{}, s.limit+1)
 	limited := false
-	degraded := false
+	incomplete := false
 	var discoveredMu sync.Mutex
 	for _, host := range hosts {
 		if net.ParseIP(host) != nil {
@@ -123,8 +123,8 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 		}
 		root, ok := normalizeName(host)
 		if !ok {
-			degraded = true
-			break
+			incomplete = true
+			continue
 		}
 
 		callCtx, cancelCall := context.WithCancel(discoveryCtx)
@@ -161,14 +161,17 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 			if parent.Err() != nil {
 				return nil, "", "", false, parent.Err()
 			}
-			degraded = true
-			break
+			incomplete = true
+			if discoveryCtx.Err() != nil {
+				break
+			}
+			continue
 		}
 		if discoveryCtx.Err() != nil && !limitReached {
 			if parent.Err() != nil {
 				return nil, "", "", false, parent.Err()
 			}
-			degraded = true
+			incomplete = true
 			break
 		}
 		if limitReached {
@@ -179,10 +182,6 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 	if parent.Err() != nil {
 		return nil, "", "", false, parent.Err()
 	}
-	if degraded {
-		return hosts, SubdomainsDegraded, NoSource, false, nil
-	}
-
 	names := make([]string, 0, len(discovered))
 	for name := range discovered {
 		names = append(names, name)
@@ -193,10 +192,20 @@ func (s *Resolver) expand(parent context.Context, hosts []string) ([]string, str
 	}
 	resolved := append(append([]string(nil), hosts...), names...)
 	status := SubdomainsComplete
+	cacheable := true
+	source := NoSource
+	if len(names) > 0 {
+		source = SubdomainsSource
+	}
 	if limited {
 		status = SubdomainsLimited
+	} else if incomplete && len(names) > 0 {
+		status = SubdomainsPartial
+	} else if incomplete {
+		status = SubdomainsDegraded
+		cacheable = false
 	}
-	return resolved, status, SubdomainsSource, true, nil
+	return resolved, status, source, cacheable, nil
 }
 
 func (s *Resolver) CacheCount() int { return s.cache.Count() }

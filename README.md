@@ -53,13 +53,15 @@ Resolves one or more hostnames and returns their IPv4 addresses, one per line, s
 - `X-Cache: MISS` — result freshly resolved
 - `X-Subdomains-Status: complete` — discovery completed, including when no names were found
 - `X-Subdomains-Status: limited` — the global discovered-name limit was reached
-- `X-Subdomains-Status: degraded` — discovery failed or timed out; only the original hosts were resolved
-- `X-Subdomains-Source: subfinder` — Subfinder was used (`complete` or `limited`)
-- `X-Subdomains-Source: none` — discovery was unavailable, or all inputs were IP literals
+- `X-Subdomains-Status: partial` — at least one provider failed or timed out, but already discovered names were retained
+- `X-Subdomains-Status: degraded` — discovery failed or timed out before finding any names; only the original hosts were resolved
+- `X-Subdomains-Source: direct` — at least one discovered name was retained
+- `X-Subdomains-Source: none` — no discovered name was retained, or all inputs were IP literals
 
 The `X-Subdomains-*` headers are only present when `subdomains=true`. Successful
-`complete` and `limited` results are cached with their metadata; degraded results
-are never cached. Cache entries for requests with and without discovery are separate.
+`complete`, `partial`, and `limited` results are cached with their metadata;
+degraded results are never cached. Cache entries for requests with and without
+discovery are separate.
 
 **Errors:**
 
@@ -83,16 +85,22 @@ curl "http://localhost:8080/resolve?host=t.me&cache=false"
 curl "http://localhost:8080/resolve?host=example.com&subdomains=true"
 ```
 
-Subdomain discovery uses Subfinder's passive sources that explicitly require no
-API key. Provider configuration and API keys are not supported. Each requested
-host is its own search boundary: no public-suffix expansion is performed. Only
-ASCII DNS names (including punycode) are accepted from discovery, and wildcard or
-out-of-bound names are discarded.
+Subdomain discovery queries crt.sh, sub.md, and HackerTarget directly without API
+keys. Each requested host is its own search boundary: no public-suffix expansion
+is performed. Only ASCII DNS names (including punycode) are accepted from
+discovery, and wildcard or out-of-bound names are discarded.
 
-Discovery is best-effort and may be incomplete: one operation runs at a time,
-waits at most 15 seconds overall, and keeps at most `SUBDOMAIN_LIMIT` new unique
-names across the request. DNS lookups are limited to 32 concurrent operations
-process-wide and 3 seconds each, including time waiting for a lookup slot.
+Providers run independently with an 8-second timeout, while the whole discovery
+stage is bounded by `SUBDOMAIN_TIMEOUT`. Results from healthy providers survive a
+timeout or failure elsewhere. Providers honor `Retry-After`; rate-limited
+providers enter an in-memory cooldown (one hour when the server supplies no valid
+delay). Anonymous upstream quotas still apply: sub.md documents 50 requests/day
+and 1 request/second, while HackerTarget host search documents 20 requests/day
+and at most 50 results/request.
+
+Discovery keeps at most `SUBDOMAIN_LIMIT` new unique names across the request.
+DNS lookups are limited to 32 concurrent operations process-wide and 3 seconds
+each, including time waiting for a lookup slot.
 
 ---
 
@@ -125,6 +133,7 @@ cache cleared
 | `PORT` | `8080` | Port to listen on |
 | `CACHE_TTL` | `300` | Default cache TTL in seconds |
 | `SUBDOMAIN_LIMIT` | `500` | Positive global limit for newly discovered unique names per request; invalid values prevent startup |
+| `SUBDOMAIN_TIMEOUT` | `20` | Positive overall subdomain-discovery timeout in seconds; invalid values prevent startup |
 
 ---
 
@@ -140,6 +149,7 @@ services:
     environment:
       CACHE_TTL: 300
       SUBDOMAIN_LIMIT: 500
+      SUBDOMAIN_TIMEOUT: 20
       PORT: 8080
 ```
 
@@ -163,10 +173,8 @@ go build -o digger ./cmd/digger
 ./digger
 ```
 
-Subdomain discovery is provided by
-[`github.com/projectdiscovery/subfinder/v2`](https://github.com/projectdiscovery/subfinder)
-v2.16.0 through an internal adapter; its SDK types are not exposed to the HTTP or
-service layers.
+Subdomain discovery uses small internal HTTP adapters for crt.sh, sub.md, and
+HackerTarget; provider details are not exposed to the HTTP or service layers.
 
 ---
 

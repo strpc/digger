@@ -40,6 +40,20 @@ type fakeDNS struct {
 	ips   []string
 }
 
+type blockingDiscoverer struct {
+	started chan struct{}
+	value   string
+}
+
+func (d blockingDiscoverer) Discover(ctx context.Context, _ string, emit func(string) bool) error {
+	close(d.started)
+	if d.value != "" {
+		emit(d.value)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func (f *fakeDNS) Resolve(_ context.Context, hosts []string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -50,7 +64,7 @@ func (f *fakeDNS) Resolve(_ context.Context, hosts []string) []string {
 func TestResolveWithoutSubdomainsPreservesOriginalBehavior(t *testing.T) {
 	discoverer := &fakeDiscoverer{}
 	dns := &fakeDNS{ips: []string{"1.1.1.1"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 2)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 2, time.Minute)
 
 	result, err := svc.Resolve(context.Background(), []string{"example.com"}, false, true, time.Minute)
 	if err != nil {
@@ -72,7 +86,7 @@ func TestDiscoveryNormalizesFiltersAndLimitsGlobally(t *testing.T) {
 		},
 	}}
 	dns := &fakeDNS{ips: []string{"2.2.2.2"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 2)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 2, time.Minute)
 
 	result, err := svc.Resolve(context.Background(), []string{"example.com"}, true, true, time.Minute)
 	if err != nil {
@@ -90,13 +104,37 @@ func TestDiscoveryNormalizesFiltersAndLimitsGlobally(t *testing.T) {
 	}
 }
 
-func TestDiscoveryErrorDiscardsNamesAndDoesNotCache(t *testing.T) {
+func TestDiscoveryErrorKeepsNamesAndCachesPartialResult(t *testing.T) {
 	discoverer := &fakeDiscoverer{
 		values: map[string][]string{"example.com": {"a.example.com"}},
 		err:    errors.New("provider failed"),
 	}
 	dns := &fakeDNS{ips: []string{"3.3.3.3"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, time.Minute)
+
+	for range 2 {
+		result, err := svc.Resolve(context.Background(), []string{"example.com"}, true, true, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.SubdomainsStatus != SubdomainsPartial || result.SubdomainsSource != SubdomainsSource {
+			t.Fatalf("unexpected metadata: %+v", result)
+		}
+	}
+	if discoverer.calls != 1 {
+		t.Fatalf("partial result was not cached: calls = %d", discoverer.calls)
+	}
+	for _, hosts := range dns.hosts {
+		if !slices.Equal(hosts, []string{"example.com", "a.example.com"}) {
+			t.Fatalf("discovered names were discarded: %v", hosts)
+		}
+	}
+}
+
+func TestDiscoveryErrorWithoutNamesIsDegradedAndNotCached(t *testing.T) {
+	discoverer := &fakeDiscoverer{err: errors.New("provider failed")}
+	dns := &fakeDNS{ips: []string{"3.3.3.3"}}
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, time.Minute)
 
 	for range 2 {
 		result, err := svc.Resolve(context.Background(), []string{"example.com"}, true, true, time.Minute)
@@ -110,17 +148,50 @@ func TestDiscoveryErrorDiscardsNamesAndDoesNotCache(t *testing.T) {
 	if discoverer.calls != 2 {
 		t.Fatalf("degraded result was cached: calls = %d", discoverer.calls)
 	}
-	for _, hosts := range dns.hosts {
-		if !slices.Equal(hosts, []string{"example.com"}) {
-			t.Fatalf("discovered names were not discarded: %v", hosts)
-		}
+}
+
+func TestDiscoveryTimeoutKeepsEmittedNames(t *testing.T) {
+	discoverer := blockingDiscoverer{started: make(chan struct{}), value: "a.example.com"}
+	dns := &fakeDNS{ips: []string{"3.3.3.3"}}
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, 10*time.Millisecond)
+
+	result, err := svc.Resolve(context.Background(), []string{"example.com"}, true, true, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SubdomainsStatus != SubdomainsPartial || result.SubdomainsSource != SubdomainsSource {
+		t.Fatalf("unexpected metadata: %+v", result)
+	}
+	if !slices.Equal(dns.hosts[0], []string{"example.com", "a.example.com"}) {
+		t.Fatalf("resolved hosts = %v", dns.hosts[0])
+	}
+}
+
+func TestParentCancellationStopsBeforeDNSAndCache(t *testing.T) {
+	discoverer := blockingDiscoverer{started: make(chan struct{})}
+	dns := &fakeDNS{ips: []string{"3.3.3.3"}}
+	c := cache.New(time.Minute)
+	svc := NewResolver(c, dns, discoverer, 10, time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Resolve(ctx, []string{"example.com"}, true, true, time.Minute)
+		done <- err
+	}()
+	<-discoverer.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(dns.hosts) != 0 || c.Count() != 0 {
+		t.Fatalf("cancellation continued processing: DNS calls=%d cache=%d", len(dns.hosts), c.Count())
 	}
 }
 
 func TestCacheSeparatesModesAndRestoresMetadata(t *testing.T) {
 	discoverer := &fakeDiscoverer{values: map[string][]string{"example.com": {"a.example.com"}}}
 	dns := &fakeDNS{ips: []string{"4.4.4.4"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, time.Minute)
 	hosts := []string{"example.com"}
 
 	if _, err := svc.Resolve(context.Background(), hosts, false, true, time.Minute); err != nil {
@@ -148,7 +219,7 @@ func TestCacheSeparatesModesAndRestoresMetadata(t *testing.T) {
 func TestCacheFalseBypassesReadButWritesResult(t *testing.T) {
 	discoverer := &fakeDiscoverer{}
 	dns := &fakeDNS{ips: []string{"5.5.5.5"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, time.Minute)
 	hosts := []string{"example.com"}
 
 	first, err := svc.Resolve(context.Background(), hosts, false, false, time.Minute)
@@ -167,7 +238,7 @@ func TestCacheFalseBypassesReadButWritesResult(t *testing.T) {
 func TestIPOnlySkipsDiscovery(t *testing.T) {
 	discoverer := &fakeDiscoverer{}
 	dns := &fakeDNS{ips: []string{"192.0.2.1"}}
-	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10)
+	svc := NewResolver(cache.New(time.Minute), dns, discoverer, 10, time.Minute)
 
 	result, err := svc.Resolve(context.Background(), []string{"192.0.2.1"}, true, true, time.Minute)
 	if err != nil {
