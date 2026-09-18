@@ -37,7 +37,10 @@ func main() {
 	}
 
 	c := cache.New(time.Duration(ttlSecs) * time.Second)
-	discoverer := discovery.New()
+	discoverer := discovery.New(discovery.Config{
+		SubMDAPIKey:        os.Getenv("SUBMD_API_KEY"),
+		HackerTargetAPIKey: os.Getenv("HACKERTARGET_API_KEY"),
+	})
 	resolveService := service.NewResolver(c, resolver.New(), discoverer, subdomainLimit, subdomainTimeout)
 	s := server.New(resolveService, version, commitHash)
 

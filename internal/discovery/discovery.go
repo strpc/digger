@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ const (
 	defaultCooldown = time.Hour
 	maxBodySize     = 5 * 1024 * 1024
 	maxScannerToken = 1024 * 1024
+	maxLoggedLine   = 256
 )
 
 var errCooldown = errors.New("provider is cooling down")
@@ -36,27 +38,36 @@ type Provider interface {
 type Aggregator struct {
 	providers []Provider
 	timeout   time.Duration
+	logf      func(format string, args ...any)
 }
 
-func New() *Aggregator {
+type Config struct {
+	SubMDAPIKey        string
+	HackerTargetAPIKey string
+}
+
+func New(config Config) *Aggregator {
 	client := &http.Client{}
 	state := newProviderState(time.Now)
 	return newAggregator([]Provider{
 		&crtshProvider{client: client, endpoint: "https://crt.sh/", state: state},
-		&subMDProvider{client: client, endpoint: "https://api.sub.md/v1/search", state: state},
-		&hackerTargetProvider{client: client, endpoint: "https://api.hackertarget.com/hostsearch/", state: state},
+		&subMDProvider{client: client, endpoint: "https://api.sub.md/v1/search", state: state, apiKey: config.SubMDAPIKey},
+		&hackerTargetProvider{client: client, endpoint: "https://api.hackertarget.com/hostsearch/", state: state, apiKey: config.HackerTargetAPIKey},
 	}, providerTimeout)
 }
 
 func newAggregator(providers []Provider, timeout time.Duration) *Aggregator {
-	return &Aggregator{providers: providers, timeout: timeout}
+	return &Aggregator{providers: providers, timeout: timeout, logf: log.Printf}
 }
 
 func (a *Aggregator) Discover(ctx context.Context, root string, emit func(string) bool) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type providerResult struct{ err error }
+	type providerResult struct {
+		name string
+		err  error
+	}
 	results := make(chan providerResult, len(a.providers))
 	var emitMu sync.Mutex
 	stopped := false
@@ -79,7 +90,7 @@ func (a *Aggregator) Discover(ctx context.Context, root string, emit func(string
 				}
 				return true
 			})
-			results <- providerResult{err: err}
+			results <- providerResult{name: provider.Name(), err: err}
 		}()
 	}
 
@@ -87,6 +98,9 @@ func (a *Aggregator) Discover(ctx context.Context, root string, emit func(string
 	for range a.providers {
 		result := <-results
 		if result.err != nil {
+			if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) && !errors.Is(result.err, errCooldown) {
+				a.logf("subdomain provider %s failed: %v", result.name, result.err)
+			}
 			providerErrors = append(providerErrors, result.err)
 		}
 	}
@@ -197,6 +211,14 @@ func responseError(name string, response *http.Response) error {
 	return fmt.Errorf("%s: unexpected HTTP status %d", name, response.StatusCode)
 }
 
+func requestError(name string, err error) error {
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		err = urlError.Err
+	}
+	return fmt.Errorf("%s: request failed: %w", name, err)
+}
+
 type crtshProvider struct {
 	client   *http.Client
 	endpoint string
@@ -215,7 +237,7 @@ func (p *crtshProvider) Discover(ctx context.Context, root string, emit func(str
 	}
 	response, err := p.client.Do(request)
 	if err != nil {
-		return err
+		return requestError(p.Name(), err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -272,6 +294,7 @@ type subMDProvider struct {
 	client   *http.Client
 	endpoint string
 	state    *providerState
+	apiKey   string
 }
 
 func (p *subMDProvider) Name() string { return "submd" }
@@ -290,9 +313,12 @@ func (p *subMDProvider) Discover(ctx context.Context, root string, emit func(str
 	if err != nil {
 		return err
 	}
+	if p.apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
 	response, err := p.client.Do(request)
 	if err != nil {
-		return err
+		return requestError(p.Name(), err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusNotFound {
@@ -316,6 +342,7 @@ type hackerTargetProvider struct {
 	client   *http.Client
 	endpoint string
 	state    *providerState
+	apiKey   string
 }
 
 func (p *hackerTargetProvider) Name() string { return "hackertarget" }
@@ -324,13 +351,17 @@ func (p *hackerTargetProvider) Discover(ctx context.Context, root string, emit f
 	if err := p.state.check(p.Name()); err != nil {
 		return err
 	}
-	request, err := newRequest(ctx, p.endpoint, url.Values{"q": {root}})
+	query := url.Values{"q": {root}}
+	if p.apiKey != "" {
+		query.Set("apikey", p.apiKey)
+	}
+	request, err := newRequest(ctx, p.endpoint, query)
 	if err != nil {
 		return err
 	}
 	response, err := p.client.Do(request)
 	if err != nil {
-		return err
+		return requestError(p.Name(), err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -345,14 +376,14 @@ func (p *hackerTargetProvider) Discover(ctx context.Context, root string, emit f
 		lower := strings.ToLower(line)
 		if strings.Contains(lower, "api count exceeded") || strings.Contains(lower, "quota") && strings.Contains(lower, "exceed") {
 			quotaExceeded = true
-			return errors.New("hackertarget: anonymous quota exceeded")
+			return errors.New("hackertarget: quota exceeded")
 		}
 		if lower == "no records found" || lower == "no records found." {
 			return nil
 		}
 		record, parseErr := csv.NewReader(strings.NewReader(line)).Read()
 		if parseErr != nil || len(record) != 2 || net.ParseIP(strings.TrimSpace(record[1])) == nil {
-			return fmt.Errorf("hackertarget: unexpected response line %q", line)
+			return fmt.Errorf("hackertarget: unexpected response line %q", truncateForLog(line))
 		}
 		if !emit(strings.TrimSpace(record[0])) {
 			return context.Canceled
@@ -363,6 +394,13 @@ func (p *hackerTargetProvider) Discover(ctx context.Context, root string, emit f
 		p.state.coolDown(p.Name(), "")
 	}
 	return err
+}
+
+func truncateForLog(value string) string {
+	if len(value) <= maxLoggedLine {
+		return value
+	}
+	return value[:maxLoggedLine] + "..."
 }
 
 func scanLines(reader io.Reader, provider string, consume func(string) error) error {

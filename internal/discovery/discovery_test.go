@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +47,38 @@ func TestSubMDNotFoundIsSuccessfulEmptyResult(t *testing.T) {
 	if err := provider.Discover(context.Background(), "example.com", func(string) bool { return true }); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestProviderAPIKeys(t *testing.T) {
+	t.Run("submd bearer", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("Authorization"); got != "Bearer submd-secret" {
+				t.Fatalf("Authorization = %q", got)
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer server.Close()
+
+		provider := &subMDProvider{client: server.Client(), endpoint: server.URL, state: newProviderState(time.Now), apiKey: "submd-secret"}
+		if err := provider.Discover(context.Background(), "example.com", func(string) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("hackertarget query", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("apikey"); got != "hacker-secret" {
+				t.Fatalf("apikey = %q", got)
+			}
+			fmt.Fprintln(w, "a.example.com,192.0.2.1")
+		}))
+		defer server.Close()
+
+		provider := &hackerTargetProvider{client: server.Client(), endpoint: server.URL, state: newProviderState(time.Now), apiKey: "hacker-secret"}
+		if err := provider.Discover(context.Background(), "example.com", func(string) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestHackerTargetParsesRowsAndCoolsDownOnQuotaMessage(t *testing.T) {
@@ -151,5 +185,41 @@ func TestAggregatorKeepsResultsWhenProviderFails(t *testing.T) {
 	}
 	if !slices.Equal(names, []string{"a.example.com"}) {
 		t.Fatalf("names = %v", names)
+	}
+}
+
+func TestAggregatorLogsProviderFailure(t *testing.T) {
+	aggregator := newAggregator([]Provider{
+		stubProvider{name: "broken", err: errors.New("malformed response")},
+	}, time.Second)
+	var message string
+	aggregator.logf = func(format string, args ...any) {
+		message = fmt.Sprintf(format, args...)
+	}
+
+	if err := aggregator.Discover(context.Background(), "example.com", func(string) bool { return true }); err == nil {
+		t.Fatal("provider error was hidden")
+	}
+	if !strings.Contains(message, "provider broken failed") || !strings.Contains(message, "malformed response") {
+		t.Fatalf("log message = %q", message)
+	}
+}
+
+func TestRequestErrorDoesNotExposeURL(t *testing.T) {
+	err := requestError("hackertarget", &url.Error{
+		Op:  "Get",
+		URL: "https://example.test/?apikey=secret",
+		Err: errors.New("connection failed"),
+	})
+	if strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "connection failed") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestTruncateForLog(t *testing.T) {
+	value := strings.Repeat("x", maxLoggedLine+10)
+	got := truncateForLog(value)
+	if len(got) != maxLoggedLine+3 || !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncated value length = %d", len(got))
 	}
 }

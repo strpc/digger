@@ -85,10 +85,11 @@ curl "http://localhost:8080/resolve?host=t.me&cache=false"
 curl "http://localhost:8080/resolve?host=example.com&subdomains=true"
 ```
 
-Subdomain discovery queries crt.sh, sub.md, and HackerTarget directly without API
-keys. Each requested host is its own search boundary: no public-suffix expansion
-is performed. Only ASCII DNS names (including punycode) are accepted from
-discovery, and wildcard or out-of-bound names are discarded.
+Subdomain discovery queries crt.sh, sub.md, and HackerTarget directly. sub.md and
+HackerTarget work anonymously, or can use optional API keys from the environment;
+crt.sh does not use a key. Each requested host is its own search boundary: no
+public-suffix expansion is performed. Only ASCII DNS names (including punycode)
+are accepted from discovery, and wildcard or out-of-bound names are discarded.
 
 Providers run independently with an 8-second timeout, while the whole discovery
 stage is bounded by `SUBDOMAIN_TIMEOUT`. Results from healthy providers survive a
@@ -96,7 +97,9 @@ timeout or failure elsewhere. Providers honor `Retry-After`; rate-limited
 providers enter an in-memory cooldown (one hour when the server supplies no valid
 delay). Anonymous upstream quotas still apply: sub.md documents 50 requests/day
 and 1 request/second, while HackerTarget host search documents 20 requests/day
-and at most 50 results/request.
+and at most 50 results/request. Provider failures and malformed responses are
+written to the service log with the provider name; configured API keys are not
+included in those messages.
 
 Discovery keeps at most `SUBDOMAIN_LIMIT` new unique names across the request.
 DNS lookups are limited to 32 concurrent operations process-wide and 3 seconds
@@ -134,6 +137,8 @@ cache cleared
 | `CACHE_TTL` | `300` | Default cache TTL in seconds |
 | `SUBDOMAIN_LIMIT` | `500` | Positive global limit for newly discovered unique names per request; invalid values prevent startup |
 | `SUBDOMAIN_TIMEOUT` | `20` | Positive overall subdomain-discovery timeout in seconds; invalid values prevent startup |
+| `SUBMD_API_KEY` | — | Optional sub.md bearer token; anonymous access is used when unset |
+| `HACKERTARGET_API_KEY` | — | Optional HackerTarget API key; anonymous access is used when unset |
 
 ---
 
@@ -150,6 +155,8 @@ services:
       CACHE_TTL: 300
       SUBDOMAIN_LIMIT: 500
       SUBDOMAIN_TIMEOUT: 20
+      SUBMD_API_KEY: ${SUBMD_API_KEY:-}
+      HACKERTARGET_API_KEY: ${HACKERTARGET_API_KEY:-}
       PORT: 8080
 ```
 
